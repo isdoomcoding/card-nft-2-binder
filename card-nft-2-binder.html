@@ -579,6 +579,14 @@
       filter: brightness(1.5) contrast(1.4) saturate(1);
     }
     #lb-card[data-effect="trainer-full-art"] .drif-effect-card__glare::after { content: none; }
+
+    /* Trait match strip — hide scrollbar, show right-fade when content overflows */
+    #trait-match-strip { scrollbar-width: none; -ms-overflow-style: none; }
+    #trait-match-strip::-webkit-scrollbar { display: none; }
+    #trait-match-strip.has-overflow {
+      -webkit-mask-image: linear-gradient(to right, black 0%, black 85%, transparent 100%);
+      mask-image: linear-gradient(to right, black 0%, black 85%, transparent 100%);
+    }
   </style>
 </head>
 <body class="min-h-screen">
@@ -764,6 +772,9 @@
     <div class="flex-1 min-w-0">
       <!-- Active filters -->
       <div id="active-filters" class="flex flex-wrap gap-2 mb-4 hidden"></div>
+
+      <!-- Trait match strip (populated by search query) -->
+      <div id="trait-match-strip" class="hidden flex gap-2 mb-3 overflow-x-auto pb-1 scrollbar-none"></div>
 
       <!-- Watchlist -->
       <div class="mb-5 p-3 sm:p-4 rounded-2xl border border-white/[0.07] bg-white/[0.03] backdrop-blur-xl">
@@ -1075,6 +1086,7 @@
     let assets = [];
     let listings = [];
     let search = '';
+    let _traitIndex = null;
     let activeFilters = {};
     let onlyListed = false;
     const PAGE_SIZE = 36;
@@ -1152,7 +1164,7 @@
         const chip = document.createElement('div');
         chip.className = 'filter-chip';
         chip.innerHTML = `search: <span class="font-medium text-white">${escapeHtml(search)}</span> <button class="ml-1">×</button>`;
-        chip.querySelector('button').onclick = () => { search = ''; document.getElementById('search').value = ''; renderActiveFilters(); renderGrid(); };
+        chip.querySelector('button').onclick = () => { search = ''; activeFilters = {}; document.getElementById('search').value = ''; renderActiveFilters(); renderTraitMatchStrip(); renderGrid(); };
         c.appendChild(chip);
       }
       if (onlyListed) {
@@ -1280,7 +1292,10 @@
       if (hidePacks) res = res.filter(a => !isPack(a));
       if (search.trim()) {
         const q = search.toLowerCase();
-        res = res.filter(a => (a?.content?.metadata?.name || '').toLowerCase().includes(q));
+        res = res.filter(a => {
+          if ((a?.content?.metadata?.name || '').toLowerCase().includes(q)) return true;
+          return Object.values(extractTraits(a)).some(v => v.toLowerCase().includes(q));
+        });
       }
       Object.entries(activeFilters).forEach(([trait, value]) => {
         res = res.filter(a => extractTraits(a)[trait] === value);
@@ -1357,7 +1372,7 @@
         const pill = document.createElement('span');
         pill.className = 'trait-pill hover:scale-105 active:scale-95';
         pill.textContent = v;
-        pill.onclick = (e) => { e.stopImmediatePropagation(); applyTraitFilter(k, v); };
+        pill.onclick = (e) => { e.stopImmediatePropagation(); searchByTraitValue(v); };
         traitWrap.appendChild(pill);
       });
       card.onclick = () => openDetail(asset);
@@ -1658,8 +1673,19 @@
 
     function applyTraitFilter(trait, value) {
       activeFilters[trait] = value;
-      
       renderActiveFilters();
+      renderTraitMatchStrip();
+      renderGrid();
+      window.scrollTo({ top: 160, behavior: 'smooth' });
+    }
+
+    function searchByTraitValue(value) {
+      search = value;
+      activeFilters = {};
+      const el = document.getElementById('search');
+      if (el) el.value = value;
+      renderActiveFilters();
+      renderTraitMatchStrip();
       renderGrid();
       window.scrollTo({ top: 160, behavior: 'smooth' });
     }
@@ -1684,6 +1710,7 @@
       const traitSearchClear = document.getElementById('trait-search-clear');
       if (traitSearchClear) traitSearchClear.classList.add('hidden');
       renderActiveFilters();
+      renderTraitMatchStrip();
       renderGrid();
       renderTraitBrowser();
     }
@@ -1996,7 +2023,7 @@
         const btn = document.createElement('button');
         btn.className = 'px-4 py-2 text-sm rounded-2xl bg-white/5 border border-white/10 text-zinc-200 hover:bg-white/10 hover:border-amber-400/40 hover:text-amber-200 transition flex items-center gap-2';
         btn.innerHTML = `${escapeHtml(k)}: <span class="font-medium">${escapeHtml(v)}</span>`;
-        btn.onclick = () => { applyTraitFilter(k, v); closeModal(); };
+        btn.onclick = () => { closeModal(); searchByTraitValue(v); };
         traitsWrap.appendChild(btn);
       });
 
@@ -2481,7 +2508,7 @@
       document.getElementById('loading-more').classList.add('hidden');
 
       assets = [];
-      
+      _traitIndex = null;
       loadingMore = false;
 
       // Fire listings in background (silent to avoid console spam on every poll)
@@ -2582,7 +2609,7 @@
       setTimeout(syncHeaderHeight, 300); // re-measure after Tailwind/fonts settle
 
       // Tailwind script already loaded via CDN
-      document.getElementById('search').oninput = (e) => { search = e.target.value; renderActiveFilters(); renderGrid(); };
+      document.getElementById('search').oninput = (e) => { search = e.target.value; if (!search) activeFilters = {}; renderActiveFilters(); renderTraitMatchStrip(); renderGrid(); };
 
       // Trait search (filters the sidebar categories/values, auto-expanding matches)
       const traitSearchEl = document.getElementById('trait-search');
@@ -2663,6 +2690,57 @@
           document.getElementById('stats').textContent = 'Still loading the first batch from Helius…';
         }
       }, 4000);
+    }
+
+    function _buildTraitIndex() {
+      _traitIndex = new Map();
+      for (const a of assets) {
+        for (const [trait, value] of Object.entries(extractTraits(a))) {
+          if (!_traitIndex.has(trait)) _traitIndex.set(trait, new Map());
+          const vm = _traitIndex.get(trait);
+          vm.set(value, (vm.get(value) || 0) + 1);
+        }
+      }
+    }
+
+    function renderTraitMatchStrip() {
+      const strip = document.getElementById('trait-match-strip');
+      if (!strip) return;
+      const q = (search || '').trim();
+      if (!q) { strip.innerHTML = ''; strip.classList.add('hidden'); return; }
+      if (!_traitIndex) _buildTraitIndex();
+      const ql = q.toLowerCase();
+      const results = [];
+      for (const [trait, valueMap] of _traitIndex) {
+        for (const [value, count] of valueMap) {
+          if (value.toLowerCase().includes(ql)) results.push({ trait, value, count });
+        }
+      }
+      results.sort((a, b) => b.count - a.count);
+      if (!results.length) { strip.innerHTML = ''; strip.classList.add('hidden'); return; }
+      strip.classList.remove('hidden');
+      strip.innerHTML = results.slice(0, 24).map(({ trait, value, count }) => {
+        const active = activeFilters[trait] === value;
+        return `<button data-trait="${escapeHtml(trait)}" data-value="${escapeHtml(value)}"
+          class="shrink-0 flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs border transition-colors whitespace-nowrap ${
+            active
+              ? 'bg-amber-500/20 border-amber-500/40 text-amber-200'
+              : 'bg-white/[0.04] border-white/10 hover:bg-white/[0.08] hover:border-white/20 text-zinc-300'
+          }">
+          <span class="text-zinc-500">${escapeHtml(trait)}:</span>
+          <span>${escapeHtml(value)}</span>
+          <span class="text-zinc-600 text-[10px] ml-0.5">${count}</span>
+        </button>`;
+      }).join('');
+      strip.querySelectorAll('button[data-trait]').forEach(btn => {
+        btn.onclick = () => {
+          activeFilters = {};
+          applyTraitFilter(btn.dataset.trait, btn.dataset.value);
+        };
+      });
+      requestAnimationFrame(() => {
+        strip.classList.toggle('has-overflow', strip.scrollWidth > strip.clientWidth);
+      });
     }
 
     window.onload = init;
