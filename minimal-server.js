@@ -224,6 +224,54 @@ function warmFromDisk() {
   } catch {}
 }
 
+// === Listings: ME + Tensor (fetched server-side, merged, cached 30 s) ===
+const TENSOR_UUID  = '0ae22a03-5109-4179-ad81-6f842f2b06a6';
+const TENSOR_GQL   = 'https://graphql.tensor.trade/graphql';
+const TENSOR_QUERY = `query L($slug:String!,$sortBy:ActiveListingsSortBy!,$cursor:ActiveListingsCursorInputV2,$limit:Int){activeListingsV2(slug:$slug,sortBy:$sortBy,cursor:$cursor,limit:$limit){txs{tx{sellerId}mint{onchainId listingNormalizedPrice}}page{endCursor{str}hasMore}}}`;
+
+async function fetchTensorListings() {
+  const out = [];
+  let cursor = null;
+  for (let page = 0; page < 20; page++) {
+    const vars = { slug: TENSOR_UUID, sortBy: 'PriceAsc', limit: 100 };
+    if (cursor) vars.cursor = { str: cursor };
+    const r = await fetch(TENSOR_GQL, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'user-agent': 'binder/1.0' },
+      body: JSON.stringify({ query: TENSOR_QUERY, variables: vars }),
+    });
+    const j = await r.json();
+    const pg = j?.data?.activeListingsV2;
+    if (!pg) break;
+    for (const { tx, mint } of pg.txs ?? []) {
+      if (mint?.onchainId && mint?.listingNormalizedPrice)
+        out.push({ mint: mint.onchainId, price: Number(mint.listingNormalizedPrice) / 1e9, seller: tx?.sellerId || '', marketplace: 'tensor' });
+    }
+    if (!pg.page?.hasMore) break;
+    cursor = pg.page.endCursor?.str ?? null;
+    if (!cursor) break;
+  }
+  return out;
+}
+
+async function fetchMEListings() {
+  const out = [];
+  for (let offset = 0; offset < 5000; offset += 500) {
+    const r = await fetch(`https://api-mainnet.magiceden.dev/v2/collections/card_nft_2/listings?offset=${offset}&limit=500`, {
+      headers: { accept: 'application/json', 'user-agent': 'binder/1.0' },
+    });
+    if (!r.ok) break;
+    const data = await r.json();
+    if (!Array.isArray(data) || data.length === 0) break;
+    for (const l of data) {
+      const mint = l.tokenMint || l.mint;
+      if (mint) out.push({ mint, price: Number(l.price || 0), seller: l.seller || '', marketplace: 'magic-eden' });
+    }
+    if (data.length < 500) break;
+  }
+  return out;
+}
+
 // === Create server ===
 const server = http.createServer(async (req, res) => {
   const p = req.url.split('?')[0];
@@ -317,51 +365,36 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
-  // 2. Magic Eden listings (GET, cached)
+  // 2. Combined ME + Tensor listings (both fetched server-side, merged, cached 30 s)
   if (req.method === 'GET' && p === '/listings/card_nft_2') {
-    // Sanitize input: only offset/limit are honoured, clamped to sane ranges.
-    // This bounds the cache keyspace and prevents arbitrary query passthrough.
-    const sp = new URL(req.url, 'http://local').searchParams;
-    const offset = Math.max(0, Math.min(100000, parseInt(sp.get('offset') || '0', 10) || 0));
-    const limit = Math.max(1, Math.min(500, parseInt(sp.get('limit') || '100', 10) || 100));
-    const cleanQs = `?offset=${offset}&limit=${limit}`;
-    const key = 'me' + cleanQs;
-    if (isFresh(key, LISTINGS_TTL)) return sendBuffer(req, res, 200, Buffer.from(JSON.stringify(listingsCache.get(key).data)), 'application/json', { 'x-cached': 'true' });
-
-    const target = `https://api-mainnet.magiceden.dev/v2/collections/card_nft_2/listings${cleanQs}`;
-    const url = new URL(target);
-    const lib = url.protocol === 'https:' ? https : http;
-    const r = lib.request({ hostname: url.hostname, port: url.port || 443, path: url.pathname + url.search, method: 'GET', headers: { 'accept': 'application/json', 'user-agent': 'binder/1.0' } }, (up) => {
-      let body = '';
-      up.on('data', c => body += c);
-      up.on('end', () => {
-        let json = null;
-        try { json = JSON.parse(body); } catch {}
-        const ok = up.statusCode >= 200 && up.statusCode < 300 && Array.isArray(json);
-        if (ok) {
-          listingsCache.set(key, { data: json, ts: Date.now() });
-          return sendBuffer(req, res, 200, Buffer.from(JSON.stringify(json)), 'application/json', { 'x-cached': 'false' });
-        }
-        // ME hiccup (rate-limit/5xx/garbage): serve last good cache, else empty — never 502
-        const c = listingsCache.get(key);
-        sendBuffer(req, res, 200, Buffer.from(JSON.stringify(c ? c.data : [])), 'application/json', { 'x-cached': c ? 'stale' : 'empty' });
-      });
-    });
-    r.on('error', () => {
-      const c = listingsCache.get(key);
-      sendBuffer(req, res, 200, Buffer.from(JSON.stringify(c ? c.data : [])), 'application/json', { 'x-cached': c ? 'stale' : 'empty' });
-    });
-    r.setTimeout(8000, () => r.destroy());  // don't hang on a slow ME; triggers the error path -> stale/empty
-    r.end();
-    return;
-  }
-
-  // 3. Tensor is dead for this collection (tensor-api.tensor.so no longer resolves;
-  //    Tensor moved to a keyed API). Return an empty 200 so the client falls through
-  //    cleanly instead of the browser logging 502s. Drain the POST body first.
-  if (req.method === 'POST' && p === '/listings/tensor') {
-    req.resume();
-    return writeJson(res, 200, {});
+    const sp     = new URL(req.url, 'http://local').searchParams;
+    const offset = Math.max(0, Math.min(100000, parseInt(sp.get('offset') || '0',   10) || 0));
+    const limit  = Math.max(1, Math.min(500,    parseInt(sp.get('limit')  || '100', 10) || 100));
+    const cached = listingsCache.get('merged');
+    if (cached && Date.now() - cached.ts < LISTINGS_TTL) {
+      const slice = cached.data.slice(offset, offset + limit);
+      return sendBuffer(req, res, 200, Buffer.from(JSON.stringify(slice)), 'application/json', { 'x-cached': 'true' });
+    }
+    try {
+      const [meRes, tRes] = await Promise.allSettled([fetchMEListings(), fetchTensorListings()]);
+      const me     = meRes.status === 'fulfilled' ? meRes.value : [];
+      const tensor = tRes.status  === 'fulfilled' ? tRes.value  : [];
+      // Dedup by mint — lowest price wins across marketplaces
+      const byMint = new Map();
+      for (const l of [...me, ...tensor]) {
+        const cur = byMint.get(l.mint);
+        if (!cur || l.price < cur.price) byMint.set(l.mint, l);
+      }
+      const merged = [...byMint.values()].sort((a, b) => a.price - b.price);
+      if (merged.length > 0 || !cached) listingsCache.set('merged', { data: merged, ts: Date.now() });
+      const slice = listingsCache.get('merged').data.slice(offset, offset + limit);
+      return sendBuffer(req, res, 200, Buffer.from(JSON.stringify(slice)), 'application/json',
+        { 'x-cached': 'false', 'x-source': `me:${me.length}+tensor:${tensor.length}` });
+    } catch {
+      const c = listingsCache.get('merged');
+      const slice = c ? c.data.slice(offset, offset + limit) : [];
+      return sendBuffer(req, res, 200, Buffer.from(JSON.stringify(slice)), 'application/json', { 'x-cached': c ? 'stale' : 'empty' });
+    }
   }
 
   // 4. Static files — STRICT allowlist.
