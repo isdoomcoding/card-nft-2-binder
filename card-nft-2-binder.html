@@ -970,23 +970,59 @@
       const isHttp = location.protocol === 'http:' || location.protocol === 'https:';
 
       if (isHttp) {
-        // Server merges ME + Tensor — single endpoint, paginated until empty
-        try {
-          const all = [];
-          for (let offset = 0; offset < 5000; offset += 100) {
-            const r = await fetch(`/listings/card_nft_2?offset=${offset}&limit=100`, { headers });
-            if (!r.ok) break;
-            const page = await r.json();
-            if (!Array.isArray(page) || page.length === 0) break;
-            all.push(...page);
-          }
-          const combined = all.map(l => ({ mint: l.tokenMint || l.mint, priceSol: Number(l.price || 0), seller: l.seller, source: l.marketplace || 'server' }));
-          if (combined.length > 0) {
-            lastListingsSuccess = true;
-            if (!silent) console.info(`%c[Listings] ${combined.length} listings (ME + Tensor, server-merged)`, 'color:#0a0');
-            return combined;
-          }
-        } catch {}
+        // ME via server proxy (cached) + Tensor direct from browser (bypasses Cloudflare)
+        const TENSOR_UUID_CLIENT = '0ae22a03-5109-4179-ad81-6f842f2b06a6';
+        const TENSOR_Q = `query L($slug:String!,$sortBy:ActiveListingsSortBy!,$cursor:ActiveListingsCursorInputV2,$limit:Int){activeListingsV2(slug:$slug,sortBy:$sortBy,cursor:$cursor,limit:$limit){txs{tx{sellerId}mint{onchainId listingNormalizedPrice}}page{endCursor{str}hasMore}}}`;
+        const [meListings, tensorListings] = await Promise.all([
+          (async () => {
+            try {
+              const all = [];
+              for (let offset = 0; offset < 5000; offset += 100) {
+                const r = await fetch(`/listings/card_nft_2?offset=${offset}&limit=100`, { headers });
+                if (!r.ok) break;
+                const page = await r.json();
+                if (!Array.isArray(page) || page.length === 0) break;
+                all.push(...page);
+              }
+              return all.map(l => ({ mint: l.tokenMint || l.mint, priceSol: Number(l.price || 0), seller: l.seller, source: l.marketplace || 'magic-eden' }));
+            } catch { return []; }
+          })(),
+          (async () => {
+            try {
+              const out = [];
+              let cursor = null;
+              for (let page = 0; page < 20; page++) {
+                const vars = { slug: TENSOR_UUID_CLIENT, sortBy: 'PriceAsc', limit: 100 };
+                if (cursor) vars.cursor = { str: cursor };
+                const r = await fetch('https://graphql.tensor.trade/graphql', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ query: TENSOR_Q, variables: vars }) });
+                if (!r.ok) break;
+                const j = await r.json();
+                const pg = j?.data?.activeListingsV2;
+                if (!pg) break;
+                for (const { tx, mint } of pg.txs ?? []) {
+                  if (mint?.onchainId && mint?.listingNormalizedPrice)
+                    out.push({ mint: mint.onchainId, priceSol: Number(mint.listingNormalizedPrice) / 1e9, seller: tx?.sellerId || '', source: 'tensor' });
+                }
+                if (!pg.page?.hasMore) break;
+                cursor = pg.page.endCursor?.str ?? null;
+                if (!cursor) break;
+              }
+              return out;
+            } catch { return []; }
+          })()
+        ]);
+        const byMint = new Map();
+        for (const l of [...meListings, ...tensorListings]) {
+          if (!l.mint) continue;
+          const cur = byMint.get(l.mint);
+          if (!cur || l.priceSol < cur.priceSol) byMint.set(l.mint, l);
+        }
+        const combined = [...byMint.values()];
+        if (combined.length > 0) {
+          lastListingsSuccess = true;
+          if (!silent) console.info(`%c[Listings] ME:${meListings.length} Tensor:${tensorListings.length} merged:${combined.length}`, 'color:#0a0');
+          return combined;
+        }
       }
 
       // Only fall back to direct/public proxies when opened as file:// (local testing)

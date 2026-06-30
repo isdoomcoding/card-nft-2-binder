@@ -256,8 +256,8 @@ async function fetchTensorListings() {
 
 async function fetchMEListings() {
   const out = [];
-  for (let offset = 0; offset < 5000; offset += 500) {
-    const r = await fetch(`https://api-mainnet.magiceden.dev/v2/collections/card_nft_2/listings?offset=${offset}&limit=500`, {
+  for (let offset = 0; offset < 5000; offset += 100) {
+    const r = await fetch(`https://api-mainnet.magiceden.dev/v2/collections/card_nft_2/listings?offset=${offset}&limit=100`, {
       headers: { accept: 'application/json', 'user-agent': 'binder/1.0' },
     });
     if (!r.ok) break;
@@ -267,7 +267,7 @@ async function fetchMEListings() {
       const mint = l.tokenMint || l.mint;
       if (mint) out.push({ mint, price: Number(l.price || 0), seller: l.seller || '', marketplace: 'magic-eden' });
     }
-    if (data.length < 500) break;
+    if (data.length < 100) break;
   }
   return out;
 }
