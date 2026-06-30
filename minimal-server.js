@@ -7,8 +7,8 @@
  *   b) No key → static snapshot from data/card-nft-2-collection.json.
  *
  * Listings:
- *   Magic Eden (GET) and Tensor (POST) are proxied through the server,
- *   cached server-side for 30–60s so one upstream call serves many users.
+ *   Magic Eden listings are proxied through the server,
+ *   cached server-side for 30s so one upstream call serves many users.
  *
  * Run:
  *   SERVER_HELIUS_KEY=... node minimal-server.js
@@ -224,36 +224,7 @@ function warmFromDisk() {
   } catch {}
 }
 
-// === Listings: ME + Tensor (fetched server-side, merged, cached 30 s) ===
-const TENSOR_UUID  = '0ae22a03-5109-4179-ad81-6f842f2b06a6';
-const TENSOR_GQL   = 'https://graphql.tensor.trade/graphql';
-const TENSOR_QUERY = `query L($slug:String!,$sortBy:ActiveListingsSortBy!,$cursor:ActiveListingsCursorInputV2,$limit:Int){activeListingsV2(slug:$slug,sortBy:$sortBy,cursor:$cursor,limit:$limit){txs{tx{sellerId}mint{onchainId listingNormalizedPrice}}page{endCursor{str}hasMore}}}`;
-
-async function fetchTensorListings() {
-  const out = [];
-  let cursor = null;
-  for (let page = 0; page < 20; page++) {
-    const vars = { slug: TENSOR_UUID, sortBy: 'PriceAsc', limit: 100 };
-    if (cursor) vars.cursor = { str: cursor };
-    const r = await fetch(TENSOR_GQL, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', 'user-agent': 'binder/1.0' },
-      body: JSON.stringify({ query: TENSOR_QUERY, variables: vars }),
-    });
-    const j = await r.json();
-    const pg = j?.data?.activeListingsV2;
-    if (!pg) break;
-    for (const { tx, mint } of pg.txs ?? []) {
-      if (mint?.onchainId && mint?.listingNormalizedPrice)
-        out.push({ mint: mint.onchainId, price: Number(mint.listingNormalizedPrice) / 1e9, seller: tx?.sellerId || '', marketplace: 'tensor' });
-    }
-    if (!pg.page?.hasMore) break;
-    cursor = pg.page.endCursor?.str ?? null;
-    if (!cursor) break;
-  }
-  return out;
-}
-
+// === Listings: ME (fetched server-side, cached 30 s) ===
 async function fetchMEListings() {
   const out = [];
   for (let offset = 0; offset < 5000; offset += 100) {
@@ -267,7 +238,7 @@ async function fetchMEListings() {
       const mint = l.tokenMint || l.mint;
       if (mint) out.push({ mint, price: Number(l.price || 0), seller: l.seller || '', marketplace: 'magic-eden' });
     }
-    if (data.length < 100) break;
+    if (data.length === 0) break;
   }
   return out;
 }
@@ -365,7 +336,7 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
-  // 2. Combined ME + Tensor listings (both fetched server-side, merged, cached 30 s)
+  // 2. ME listings (fetched server-side, cached 30 s)
   if (req.method === 'GET' && p === '/listings/card_nft_2') {
     const sp     = new URL(req.url, 'http://local').searchParams;
     const offset = Math.max(0, Math.min(100000, parseInt(sp.get('offset') || '0',   10) || 0));
@@ -376,20 +347,12 @@ const server = http.createServer(async (req, res) => {
       return sendBuffer(req, res, 200, Buffer.from(JSON.stringify(slice)), 'application/json', { 'x-cached': 'true' });
     }
     try {
-      const [meRes, tRes] = await Promise.allSettled([fetchMEListings(), fetchTensorListings()]);
-      const me     = meRes.status === 'fulfilled' ? meRes.value : [];
-      const tensor = tRes.status  === 'fulfilled' ? tRes.value  : [];
-      // Dedup by mint — lowest price wins across marketplaces
-      const byMint = new Map();
-      for (const l of [...me, ...tensor]) {
-        const cur = byMint.get(l.mint);
-        if (!cur || l.price < cur.price) byMint.set(l.mint, l);
-      }
-      const merged = [...byMint.values()].sort((a, b) => a.price - b.price);
+      const me = await fetchMEListings();
+      const merged = me.sort((a, b) => a.price - b.price);
       if (merged.length > 0 || !cached) listingsCache.set('merged', { data: merged, ts: Date.now() });
       const slice = listingsCache.get('merged').data.slice(offset, offset + limit);
       return sendBuffer(req, res, 200, Buffer.from(JSON.stringify(slice)), 'application/json',
-        { 'x-cached': 'false', 'x-source': `me:${me.length}+tensor:${tensor.length}` });
+        { 'x-cached': 'false', 'x-source': `me:${me.length}` });
     } catch {
       const c = listingsCache.get('merged');
       const slice = c ? c.data.slice(offset, offset + limit) : [];
