@@ -19,6 +19,7 @@ import https from 'https';
 import zlib from 'zlib';
 import fs from 'fs';
 import path from 'path';
+import crypto from 'crypto';
 import { fileURLToPath } from 'url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -89,6 +90,40 @@ function writeJson(res, status, data, extraHeaders) {
   const headers = { 'content-type': 'application/json', 'access-control-allow-origin': '*', ...extraHeaders };
   res.writeHead(status, headers);
   res.end(JSON.stringify(data));
+}
+
+// === Static file cache: read + gzip + ETag once per process lifetime, not per request ===
+// A fresh process (every deploy restarts pm2) means a fresh cache — no manual invalidation needed.
+const staticFileCache = new Map(); // path -> { raw, gzip, etag, contentType, cacheControl }
+const COMPRESSIBLE_TYPE = /^(text\/|application\/json)/;
+
+function getStaticFile(key, diskPath, contentType, cacheControl) {
+  let entry = staticFileCache.get(key);
+  if (entry) return entry;
+  const raw = fs.readFileSync(path.join(__dirname, diskPath));
+  const etag = '"' + crypto.createHash('sha1').update(raw).digest('hex').slice(0, 20) + '"';
+  // Images are already compressed — gzipping them wastes CPU for no size benefit.
+  const gzip = COMPRESSIBLE_TYPE.test(contentType) && raw.length > 1024 ? zlib.gzipSync(raw) : null;
+  entry = { raw, gzip, etag, contentType, cacheControl };
+  staticFileCache.set(key, entry);
+  return entry;
+}
+
+function serveStatic(req, res, entry) {
+  const headers = {
+    'content-type': entry.contentType,
+    'access-control-allow-origin': '*',
+    'cache-control': entry.cacheControl,
+    'etag': entry.etag,
+  };
+  if (req.headers['if-none-match'] === entry.etag) {
+    res.writeHead(304, headers);
+    return res.end();
+  }
+  const useGzip = !!entry.gzip && clientAcceptsGzip(req);
+  if (useGzip) { headers['content-encoding'] = 'gzip'; headers['vary'] = 'accept-encoding'; }
+  res.writeHead(200, headers);
+  res.end(useGzip ? entry.gzip : entry.raw);
 }
 
 // Keep only the fields the binder UI actually reads → ~3x smaller payload.
@@ -280,7 +315,8 @@ const server = http.createServer(async (req, res) => {
           collectionCache = buildCollectionCache(data);
           try { fs.mkdirSync(path.dirname(SLIM_SNAPSHOT), { recursive: true }); fs.writeFileSync(SLIM_SNAPSHOT, collectionCache.body); } catch {}
         } catch (e) {
-          return writeJson(res, 503, { error: 'failed to fetch live collection', detail: String(e) });
+          console.error('[collection] fetch failed:', e);
+          return writeJson(res, 503, { error: 'Collection temporarily unavailable. Please try again shortly.' });
         }
       } else if (!isFresh(collectionCache, COLLECTION_TTL)) {
         revalidateCollection(); // refresh in background; serve current copy now
@@ -332,7 +368,8 @@ const server = http.createServer(async (req, res) => {
       walletCache.set(addr, { mints, ts: Date.now() });
       return writeJson(res, 200, { address: addr, count: mints.length, mints }, { 'x-source': 'helius-live' });
     } catch (e) {
-      return writeJson(res, 502, { error: 'Wallet lookup failed.', detail: String(e) });
+      console.error('[wallet] lookup failed for', addr, ':', e);
+      return writeJson(res, 502, { error: 'Wallet lookup failed. Please try again.' });
     }
   }
 
@@ -365,14 +402,16 @@ const server = http.createServer(async (req, res) => {
   const STATIC = {
     '/':                      ['card-nft-2-binder.html', 'text/html; charset=utf-8',  'no-cache'],
     '/card-nft-2-binder.html':['card-nft-2-binder.html', 'text/html; charset=utf-8',  'no-cache'],
+    '/tailwind.css':          ['tailwind.css',            'text/css; charset=utf-8',   'no-cache'],
     '/img/grain.webp':        ['img/grain.webp',          'image/webp',                'public, max-age=31536000, immutable'],
     '/img/glitter.png':       ['img/glitter.png',         'image/png',                 'public, max-age=31536000, immutable'],
   };
   const staticEntry = req.method === 'GET' && STATIC[p];
   if (staticEntry) {
     try {
-      const raw = fs.readFileSync(path.join(__dirname, staticEntry[0]));
-      return sendBuffer(req, res, 200, raw, staticEntry[1], { 'cache-control': staticEntry[2] });
+      const file = getStaticFile(p, staticEntry[0], staticEntry[1], staticEntry[2]);
+      serveStatic(req, res, file);
+      return;
     } catch {
       res.writeHead(500); return res.end('server error');
     }

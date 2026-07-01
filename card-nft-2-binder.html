@@ -4,7 +4,9 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover"/>
   <title>Card NFT 2</title>
-  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="preconnect" href="https://images.weserv.nl">
+  <link rel="preconnect" href="https://silver-real-rhinoceros-781.mypinata.cloud">
+  <link rel="stylesheet" href="/tailwind.css">
   <style>
     body { background:#06060a; color:#ede9e1; font-family:ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; }
 
@@ -891,10 +893,6 @@
     // ========== CONFIG ==========
     const ME_SLUG = 'card_nft_2';
 
-    // Optional user-provided Helius key for realtime collection data.
-    // When set (via the 🔑 button), the browser will use it directly for fresh getAssetsByGroup calls.
-    // The key is stored ONLY in your browser's localStorage — never sent to any server.
-    // This gives you personal realtime without affecting anyone else.
     // What the server reported for /collection: 'helius-live' | 'server-cache' | 'static-snapshot'
     let serverCollectionSource = null;
 
@@ -930,34 +928,15 @@
       return thumbUrl(getImage(asset));
     }
 
-    // Load the pre-generated static snapshot (fallback when no user Helius key)
+    // Load the full collection from the server
     async function loadCollectionSnapshot() {
       const res = await fetch('/collection');
       if (!res.ok) {
-        const text = await res.text().catch(() => '');
-        throw new Error('Failed to load collection snapshot from server. ' +
-          'Either provide your own Helius key (🔑 button) for realtime, or run: node snapshot-collection.js once.');
+        throw new Error('Failed to load the collection from the server. Try refreshing the page.');
       }
       serverCollectionSource = res.headers.get('x-source') || null;
       return res.json();
     }
-
-    // Live Helius fetch using a user-provided key (for realtime / personal quota)
-    async function fetchCollectionPageLive(page, limit = 500, rpc) {
-      const body = {
-        jsonrpc: '2.0', id: 'cardnft2', method: 'getAssetsByGroup',
-        params: { groupKey: 'collection', groupValue: 'EAzEpagtyeRAx9npnpVMpygoA8ouX7DRpLTghhPvYTiu', page, limit }
-      };
-      const res = await fetch(rpc, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(body)
-      });
-      const json = await res.json();
-      if (json.error) throw new Error(JSON.stringify(json.error));
-      return json.result?.items || [];
-    }
-
 
     let listingsWarnedOnce = false;
     let lastListingsSuccess = false;
@@ -1056,6 +1035,12 @@
     // ========== STATE ==========
     let assets = [];
     let listings = [];
+    // Bumped on every reassignment so getFiltered() can cheaply tell whether
+    // the underlying data actually changed since its last call.
+    let _assetsVersion = 0;
+    let _listingsVersion = 0;
+    function setAssets(data) { assets = data; _assetsVersion++; }
+    function setListings(data) { listings = data; _listingsVersion++; }
     let search = '';
     let _traitIndex = null;
     let activeFilters = {};
@@ -1254,7 +1239,24 @@
       return map;
     }
 
+    // getFiltered() is called several times per interaction (renderGrid, openDetail,
+    // navigateModal/Lightbox, updateLightboxNav, _lbPreloadAround, renderStats) — memoize
+    // the result and only recompute when something that actually affects it has changed.
+    let _filteredCache = null;
+    let _filteredCacheKey = null;
+
     function getFiltered() {
+      const key = _assetsVersion + '|' + _listingsVersion + '|' + search + '|' +
+        JSON.stringify(activeFilters) + '|' + onlyListed + '|' + cardSort + '|' +
+        listingSort + '|' + hidePacks + '|' + walletAddress;
+      if (_filteredCache && _filteredCacheKey === key) return _filteredCache;
+      const res = _computeFiltered();
+      _filteredCacheKey = key;
+      _filteredCache = res;
+      return res;
+    }
+
+    function _computeFiltered() {
       let res = assets;
       if (walletHoldings) res = res.filter(a => walletHoldings.has(a.id));
       if (hidePacks) res = res.filter(a => !isPack(a));
@@ -1914,7 +1916,7 @@
       if (btn) btn.disabled = true;
       if (icon) { icon.classList.remove('spinning'); void icon.offsetWidth; icon.classList.add('spinning'); }
       fetchActiveListings(true).then(data => {
-        listings = data;
+        setListings(data);
         lastListingMints = new Set(data.map(l => l.mint).filter(Boolean));
         renderGrid(renderedCount);
         showToast('Listings refreshed');
@@ -2512,18 +2514,26 @@
     }
 
     // ========== DATA LOADING ==========
+    // Schedule fn for the browser's next idle slot (falls back to setTimeout on
+    // browsers without requestIdleCallback, e.g. Safari). timeout guarantees it
+    // still fires even if the browser is never truly idle.
+    function idleDefer(fn, timeout = 2000) {
+      if ('requestIdleCallback' in window) requestIdleCallback(fn, { timeout });
+      else setTimeout(fn, 0);
+    }
+
     async function loadProgressive() {
       const grid = document.getElementById('grid');
       grid.innerHTML = '<div class="col-span-full py-12 text-center text-zinc-500">Loading Card NFT 2 collection…<br><span class="text-xs text-zinc-600">First cards appear in a few seconds</span></div>';
       document.getElementById('loading-more').classList.add('hidden');
 
-      assets = [];
+      setAssets([]);
       _traitIndex = null;
       loadingMore = false;
 
       // Fire listings in background (silent to avoid console spam on every poll)
       fetchActiveListings(true).then(data => {
-        listings = data;
+        setListings(data);
         lastListingMints = new Set(data.map(l => l.mint).filter(Boolean));
         renderGrid();
       }).catch(() => {});
@@ -2536,13 +2546,21 @@
             if (r1.ok) {
               serverCollectionSource = r1.headers.get('x-source') || serverCollectionSource;
               const first = await r1.json();
-              if (Array.isArray(first) && first.length) { assets = first; renderGrid(renderedCount); }
+              if (Array.isArray(first) && first.length) { setAssets(first); renderGrid(renderedCount); }
             }
           } catch {}
-          // Full collection in background
+
+          // Full collection in background. A visitor who arrived via a shared
+          // link (?q=/?f=/?wallet=/?card=/?listed=) has explicit intent, so fetch
+          // right away; a casual first-screen browser gets it deferred to the
+          // next idle slot so it doesn't compete with first-paint rendering —
+          // and a quick bounce may skip the ~1.2MB download entirely.
           document.getElementById('loading-more').classList.remove('hidden');
+          const sp0 = new URLSearchParams(location.search);
+          const hasShareState = ['q', 'f', 'wallet', 'card', 'listed'].some(k => sp0.has(k));
+          if (!hasShareState) await new Promise(resolve => idleDefer(resolve));
           const snap = await loadCollectionSnapshot();
-          assets = Array.isArray(snap) ? snap : assets;
+          setAssets(Array.isArray(snap) ? snap : assets);
         }
 
         renderGrid(renderedCount);
@@ -2581,7 +2599,7 @@
           const changed = newMints.length > 0 || delistedMints.length > 0;
 
           lastListingMints = freshSet;
-          listings = fresh;
+          setListings(fresh);
           if (changed) {
             // "Only listed" changes the visible set -> re-render, but keep scroll depth.
             // Normal browsing -> just patch the affected cards' ribbons in place (no reset).
@@ -2630,8 +2648,16 @@
       window.addEventListener('orientationchange', () => setTimeout(syncHeaderHeight, 250));
       setTimeout(syncHeaderHeight, 300); // re-measure after Tailwind/fonts settle
 
-      // Tailwind script already loaded via CDN
-      document.getElementById('search').oninput = (e) => { search = e.target.value; if (!search) activeFilters = {}; renderActiveFilters(); renderTraitMatchStrip(); renderGrid(); syncURL(); };
+      // Debounced so a full re-filter + grid rebuild + URL sync doesn't run on every keystroke.
+      let _searchDebounce = null;
+      document.getElementById('search').oninput = (e) => {
+        search = e.target.value;
+        if (!search) activeFilters = {};
+        clearTimeout(_searchDebounce);
+        _searchDebounce = setTimeout(() => {
+          renderActiveFilters(); renderTraitMatchStrip(); renderGrid(); syncURL();
+        }, 180);
+      };
 
       // Trait search (filters the sidebar categories/values, auto-expanding matches)
       const traitSearchEl = document.getElementById('trait-search');
@@ -2674,7 +2700,7 @@
       document.addEventListener('visibilitychange', () => {
         if (document.hidden) return;
         fetchActiveListings(true).then(data => {
-          listings = data;
+          setListings(data);
           lastListingMints = new Set(data.map(l => l.mint).filter(Boolean));
           renderGrid();
         }).catch(() => {});
