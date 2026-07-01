@@ -1128,21 +1128,21 @@
         const chip = document.createElement('div');
         chip.className = 'filter-chip';
         chip.innerHTML = `${escapeHtml(trait)}: <span class="font-medium text-white">${escapeHtml(value)}</span> <button class="ml-1">×</button>`;
-        chip.querySelector('button').onclick = () => { delete activeFilters[trait]; renderActiveFilters(); renderGrid(); };
+        chip.querySelector('button').onclick = () => { delete activeFilters[trait]; renderActiveFilters(); renderGrid(); syncURL(); };
         c.appendChild(chip);
       });
       if (search) {
         const chip = document.createElement('div');
         chip.className = 'filter-chip';
         chip.innerHTML = `search: <span class="font-medium text-white">${escapeHtml(search)}</span> <button class="ml-1">×</button>`;
-        chip.querySelector('button').onclick = () => { search = ''; activeFilters = {}; document.getElementById('search').value = ''; renderActiveFilters(); renderTraitMatchStrip(); renderGrid(); };
+        chip.querySelector('button').onclick = () => { search = ''; activeFilters = {}; document.getElementById('search').value = ''; renderActiveFilters(); renderTraitMatchStrip(); renderGrid(); syncURL(); };
         c.appendChild(chip);
       }
       if (onlyListed) {
         const chip = document.createElement('div');
         chip.className = 'filter-chip text-red-400';
         chip.innerHTML = `only listed <button class="ml-1">×</button>`;
-        chip.querySelector('button').onclick = () => { onlyListed = false; updateOnlyListedUI(); renderActiveFilters(); renderGrid(); };
+        chip.querySelector('button').onclick = () => { onlyListed = false; updateOnlyListedUI(); renderActiveFilters(); renderGrid(); syncURL(); };
         c.appendChild(chip);
       }
       if (walletHoldings) {
@@ -1644,6 +1644,7 @@
       renderActiveFilters();
       renderTraitMatchStrip();
       renderGrid();
+      syncURL();
       window.scrollTo({ top: 160, behavior: 'smooth' });
     }
 
@@ -1655,6 +1656,7 @@
       renderActiveFilters();
       renderTraitMatchStrip();
       renderGrid();
+      syncURL();
       window.scrollTo({ top: 160, behavior: 'smooth' });
     }
 
@@ -1681,6 +1683,7 @@
       renderTraitMatchStrip();
       renderGrid();
       renderTraitBrowser();
+      syncURL();
     }
 
     function setHidePacks() {
@@ -1765,6 +1768,33 @@
       } catch (_) {}
     }
 
+    // Sync all shareable state to the URL (q, f, listed, wallet, card — sort is handled by syncSortToUrl).
+    function syncURL() {
+      try {
+        const url = new URL(location.href);
+        if (search.trim()) url.searchParams.set('q', search.trim()); else url.searchParams.delete('q');
+        url.searchParams.delete('f');
+        for (const [k, v] of Object.entries(activeFilters)) url.searchParams.append('f', `${k}:${v}`);
+        if (onlyListed) url.searchParams.set('listed', '1'); else url.searchParams.delete('listed');
+        if (walletAddress) url.searchParams.set('wallet', walletAddress); else url.searchParams.delete('wallet');
+        history.replaceState(null, '', url);
+      } catch (_) {}
+    }
+
+    // Restore search/filter/listed state from URL params on load (called before renderGrid).
+    function restoreFromURL() {
+      try {
+        const sp = new URLSearchParams(location.search);
+        const q = sp.get('q');
+        if (q) { search = q; const el = document.getElementById('search'); if (el) el.value = q; }
+        for (const f of sp.getAll('f')) {
+          const i = f.indexOf(':');
+          if (i > 0) activeFilters[f.slice(0, i)] = f.slice(i + 1);
+        }
+        if (sp.get('listed') === '1') { onlyListed = true; updateOnlyListedUI(); }
+      } catch (_) {}
+    }
+
     // Apply ?sort= from the URL on load (accepts: oldest, newest/recent, num-asc, num-desc, price-asc, price-desc).
     function applySortFromUrl() {
       const v = (new URLSearchParams(location.search).get('sort') || '').toLowerCase();
@@ -1831,11 +1861,12 @@
       return Array.isArray(j.mints) ? j.mints : [];
     }
 
-    async function lookupWallet() {
+    async function lookupWallet(addrOverride) {
       const inp = document.getElementById('wallet-input');
       const st = document.getElementById('wallet-status');
       const go = document.getElementById('wallet-go');
-      const addr = (inp?.value || '').trim();
+      const addr = addrOverride || (inp?.value || '').trim();
+      if (addrOverride && inp) inp.value = addrOverride;
       st.classList.remove('hidden');
       if (!/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(addr)) {
         st.style.color = '#f59e0b'; st.textContent = 'That doesn’t look like a Solana wallet address.';
@@ -1856,6 +1887,7 @@
         st.textContent = held ? ('Showing ' + held + ' card' + (held===1?'':'s') + ' held by this wallet.') : 'No Card NFT 2 cards in this wallet.';
         renderActiveFilters();
         renderGrid();
+        syncURL();
       } catch (e) {
         st.style.color = '#f87171'; st.textContent = 'Lookup failed: ' + (e.message || e);
       } finally {
@@ -1873,6 +1905,7 @@
       const inp = document.getElementById('wallet-input'); if (inp) inp.value = '';
       renderActiveFilters();
       renderGrid();
+      syncURL();
     }
 
     function refreshListingsOnly() {
@@ -2049,12 +2082,14 @@
       modal.classList.remove('hidden');
       modal.classList.add('flex');
       document.body.style.overflow = 'hidden';
+      try { const u = new URL(location.href); u.searchParams.set('card', asset.id); history.replaceState(null, '', u); } catch (_) {}
     }
     function closeModal() {
       const modal = document.getElementById('modal');
       modal.classList.add('hidden');
       modal.classList.remove('flex');
       document.body.style.overflow = '';
+      try { const u = new URL(location.href); u.searchParams.delete('card'); history.replaceState(null, '', u); } catch (_) {}
     }
 
     // Prevent a swipe's trailing phantom click from immediately closing the lightbox
@@ -2505,6 +2540,18 @@
 
         renderGrid(renderedCount);
         renderTraitBrowser();
+
+        // Restore wallet + open card from URL (deferred until full collection is available)
+        try {
+          const sp = new URLSearchParams(location.search);
+          const walletParam = sp.get('wallet');
+          if (walletParam && !walletAddress) await lookupWallet(walletParam);
+          const cardParam = sp.get('card');
+          if (cardParam) {
+            const asset = assets.find(a => a.id === cardParam);
+            if (asset) openDetail(asset);
+          }
+        } catch (_) {}
       } catch (e) {
         console.error(e);
         grid.innerHTML = `<div class="col-span-full py-12 text-red-400">Failed to load: ${e.message || e}</div>`;
@@ -2577,7 +2624,7 @@
       setTimeout(syncHeaderHeight, 300); // re-measure after Tailwind/fonts settle
 
       // Tailwind script already loaded via CDN
-      document.getElementById('search').oninput = (e) => { search = e.target.value; if (!search) activeFilters = {}; renderActiveFilters(); renderTraitMatchStrip(); renderGrid(); };
+      document.getElementById('search').oninput = (e) => { search = e.target.value; if (!search) activeFilters = {}; renderActiveFilters(); renderTraitMatchStrip(); renderGrid(); syncURL(); };
 
       // Trait search (filters the sidebar categories/values, auto-expanding matches)
       const traitSearchEl = document.getElementById('trait-search');
@@ -2593,7 +2640,7 @@
         traitSearchEl.onkeydown = (e) => { if (e.key === 'Escape') { setTraitSearch(''); traitSearchEl.blur(); } };
       }
       if (traitSearchClear) traitSearchClear.onclick = () => { setTraitSearch(''); if (traitSearchEl) traitSearchEl.focus(); };
-      document.getElementById('btn-only-listed').onclick = () => { onlyListed = !onlyListed; updateOnlyListedUI(); renderActiveFilters(); renderGrid(); };
+      document.getElementById('btn-only-listed').onclick = () => { onlyListed = !onlyListed; updateOnlyListedUI(); renderActiveFilters(); renderGrid(); syncURL(); };
       document.getElementById('btn-clear').onclick = clearAll;
       document.getElementById('btn-refresh').onclick = () => { loadProgressive(); refreshListingsOnly(); };
       document.getElementById('btn-alerts').onclick = () => { if ('Notification' in window) Notification.requestPermission(); };
@@ -2603,6 +2650,7 @@
       updateOnlyListedUI();
 
       initializeSidebarState();
+      restoreFromURL();     // restore q, f, listed from URL before first render
       applySortFromUrl();   // honor ?sort= in the URL
       // Esc closes the trait curtain (unless the trait search box is focused)
       document.addEventListener('keydown', (e) => {
