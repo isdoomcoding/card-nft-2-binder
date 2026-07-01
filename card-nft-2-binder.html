@@ -2522,6 +2522,16 @@
       else setTimeout(fn, 0);
     }
 
+    // Look up a single asset by id from the server's warm cache — used so a shared
+    // card link doesn't have to wait for the whole collection to download.
+    async function fetchAssetById(id) {
+      try {
+        const r = await fetch('/collection/asset?id=' + encodeURIComponent(id));
+        if (!r.ok) return null;
+        return await r.json();
+      } catch { return null; }
+    }
+
     async function loadProgressive() {
       const grid = document.getElementById('grid');
       grid.innerHTML = '<div class="col-span-full py-12 text-center text-zinc-500">Loading Card NFT 2 collection…<br><span class="text-xs text-zinc-600">First cards appear in a few seconds</span></div>';
@@ -2530,6 +2540,18 @@
       setAssets([]);
       _traitIndex = null;
       loadingMore = false;
+
+      // A shared card link (?card=) shouldn't have to wait for the whole ~1.2MB
+      // collection download — look it up directly and open it as soon as it
+      // resolves; the full collection still loads in the background below.
+      const sp0 = new URLSearchParams(location.search);
+      const cardParam = sp0.get('card');
+      let sharedCardHandled = false;
+      if (cardParam) {
+        fetchAssetById(cardParam).then(asset => {
+          if (asset && !sharedCardHandled) { sharedCardHandled = true; openDetail(asset); }
+        }).catch(() => {});
+      }
 
       // Fire listings in background (silent to avoid console spam on every poll)
       fetchActiveListings(true).then(data => {
@@ -2556,7 +2578,6 @@
           // next idle slot so it doesn't compete with first-paint rendering —
           // and a quick bounce may skip the ~1.2MB download entirely.
           document.getElementById('loading-more').classList.remove('hidden');
-          const sp0 = new URLSearchParams(location.search);
           const hasShareState = ['q', 'f', 'wallet', 'card', 'listed'].some(k => sp0.has(k));
           if (!hasShareState) await new Promise(resolve => idleDefer(resolve));
           const snap = await loadCollectionSnapshot();
@@ -2566,15 +2587,14 @@
         renderGrid(renderedCount);
         renderTraitBrowser();
 
-        // Restore wallet + open card from URL (deferred until full collection is available)
+        // Restore wallet + open card from URL (in case the fast-path lookup
+        // above hasn't resolved yet, or the card wasn't found there).
         try {
-          const sp = new URLSearchParams(location.search);
-          const walletParam = sp.get('wallet');
+          const walletParam = sp0.get('wallet');
           if (walletParam && !walletAddress) await lookupWallet(walletParam);
-          const cardParam = sp.get('card');
-          if (cardParam) {
+          if (cardParam && !sharedCardHandled) {
             const asset = assets.find(a => a.id === cardParam);
-            if (asset) openDetail(asset);
+            if (asset) { sharedCardHandled = true; openDetail(asset); }
           }
         } catch (_) {}
       } catch (e) {

@@ -353,6 +353,26 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
+  // 1a. /collection/asset?id=<mint> — a single asset by id, from the already-warm
+  // cache. Lets a shared card link (?card=) open instantly without waiting on the
+  // full ~1.5MB collection download.
+  if (req.method === 'GET' && p === '/collection/asset') {
+    const sp = new URL(req.url, 'http://local').searchParams;
+    const id = (sp.get('id') || '').trim();
+    if (!id) return writeJson(res, 400, { error: 'Missing id.' });
+    let asset;
+    if (HELIUS_RPC && collectionCache) {
+      asset = collectionCache.data.find(a => a.id === id);
+    } else if (!HELIUS_RPC && fs.existsSync(SNAPSHOT_PATH)) {
+      try {
+        const slim = JSON.parse(fs.readFileSync(SNAPSHOT_PATH, 'utf8')).map(slimAsset);
+        asset = slim.find(a => a.id === id);
+      } catch {}
+    }
+    if (!asset) return writeJson(res, 404, { error: 'Asset not found.' });
+    return writeJson(res, 200, asset, { 'cache-control': 'public, max-age=30' });
+  }
+
   // 1b. /wallet?address=<addr> — which cards from this collection a wallet holds
   if (req.method === 'GET' && p === '/wallet') {
     if (!HELIUS_RPC) return writeJson(res, 503, { error: 'Wallet lookup needs a server Helius key.' });
