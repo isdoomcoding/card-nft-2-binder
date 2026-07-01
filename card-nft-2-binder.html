@@ -2702,7 +2702,7 @@
         fetchActiveListings(true).then(data => {
           setListings(data);
           lastListingMints = new Set(data.map(l => l.mint).filter(Boolean));
-          renderGrid();
+          renderGrid(renderedCount);
         }).catch(() => {});
       });
 
